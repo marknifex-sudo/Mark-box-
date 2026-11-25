@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Mark Box</title>
+  <meta name="description" content="Mark Box — stream thousands of free, legal classic movies, cartoons and TV shows.">
+  <meta name="theme-color" content="#0e0d14">
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Unbounded:wght@600;800&family=Manrope:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar" id="topbar">
+    <a class="logo" href="#" data-nav="home" aria-label="Mark Box home">MARK<span>BOX</span></a>
+    <nav class="nav" aria-label="Sections">
+      <a href="#" data-nav="home" class="active">Home</a>
+      <a href="#movies" data-nav="movies">Movies</a>
+      <a href="#tv" data-nav="tv">TV &amp; Cartoons</a>
+      <a href="#mylist" data-nav="mylist">My List</a>
+    </nav>
+    <form class="search" id="searchForm" role="search">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input id="searchInput" type="search" placeholder="Search movies, shows, actors…" autocomplete="off" aria-label="Search">
+    </form>
+  </header>
+
+  <main id="app">
+    <section class="hero" id="hero" aria-label="Featured">
+      <div class="hero-bg" id="heroBg"></div>
+      <div class="hero-shade"></div>
+      <div class="hero-content">
+        <p class="eyebrow" id="heroTag">Featured tonight</p>
+        <h1 id="heroTitle">Loading the vault…</h1>
+        <p class="hero-meta" id="heroMeta"></p>
+        <p class="hero-desc" id="heroDesc"></p>
+        <div class="hero-actions">
+          <button class="btn btn-play" id="heroPlay" disabled>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4.5v15l13-7.5z"/></svg>Play
+          </button>
+          <button class="btn btn-ghost" id="heroInfo" disabled>More info</button>
+        </div>
+      </div>
+    </section>
+
+    <div id="rows" class="rows"></div>
+    <section id="grid" class="grid-view" hidden>
+      <h2 id="gridTitle"></h2>
+      <div id="gridBody" class="grid"></div>
+      <button class="btn btn-ghost more" id="gridMore" hidden>Load more</button>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <p>Mark Box streams public-domain and freely licensed films hosted by the <a href="https://archive.org" target="_blank" rel="noopener">Internet Archive</a>.</p>
+  </footer>
+
+  <!-- Details modal -->
+  <div class="modal" id="modal" hidden>
+    <div class="modal-backdrop" data-close></div>
+    <article class="modal-card" role="dialog" aria-modal="true" aria-labelledby="mTitle">
+      <button class="icon-btn modal-x" data-close aria-label="Close">✕</button>
+      <div class="modal-hero" id="mHero"></div>
+      <div class="modal-body">
+        <h2 id="mTitle"></h2>
+        <p class="hero-meta" id="mMeta"></p>
+        <div class="hero-actions">
+          <button class="btn btn-play" id="mPlay"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4.5v15l13-7.5z"/></svg>Play</button>
+          <button class="btn btn-ghost" id="mList">+ My List</button>
+        </div>
+        <div class="m-desc" id="mDesc"></div>
+        <div id="mEpisodes"></div>
+      </div>
+    </article>
+  </div>
+
+  <!-- Player -->
+  <div class="player" id="player" hidden>
+    <div class="player-top">
+      <button class="icon-btn" id="pBack" aria-label="Back">←</button>
+      <div class="p-title"><strong id="pTitle"></strong><span id="pSub"></span></div>
+      <button class="icon-btn" id="pEpisodesBtn" hidden aria-label="Episodes">☰</button>
+    </div>
+    <div class="p-stage" id="pStage">
+      <video id="video" controls playsinline preload="metadata"></video>
+      <div class="p-status" id="pStatus">Loading…</div>
+    </div>
+    <aside class="p-episodes" id="pEpisodes" hidden></aside>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+{
+  "name": "Mark Box",
+  "short_name": "Mark Box",
+  "description": "Stream free, legal classic movies, cartoons and TV shows.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0e0d14",
+  "theme_color": "#0e0d14",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
