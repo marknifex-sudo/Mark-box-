@@ -103,10 +103,10 @@
       }
       const coll = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
       return [...best.values()].sort((a, b) => coll.compare(a.key, b.key)).map(({ f, key }) => ({
-        name: f.name, url: ia.file(meta.metadata.identifier, f.name),
+        name: "ia:" + meta.metadata.identifier + "/" + f.name, url: ia.file(meta.metadata.identifier, f.name), direct: true,
         label: f.title || key.split("/").pop().replace(/\.[a-z0-9]+$/i, "").replace(/_+/g, " ").trim(),
         length: parseFloat(f.length) || 0,
-      }));
+      })).map((v) => ({ ...v, offlineUrl: v.url, download: v.url }));
     },
     async details(it) {
       const meta = await ia.meta(it.id);
@@ -280,7 +280,190 @@
     },
   };
 
-  const PROVIDERS = { ia, mv, tv, anime: an };
+  // ---------- Jellyfin: the viewer's own library ----------
+  const deviceId = store.get("device", null) || (() => { const id = "mb-" + Math.random().toString(36).slice(2) + Date.now().toString(36); store.set("device", id); return id; })();
+  const jf = {
+    cfg: store.get("jellyfin", null), // { server, token, userId, user, serverName }
+    on: () => !!(jf.cfg && jf.cfg.token),
+    authHeader(token) {
+      return `MediaBrowser Client="Mark Box", Device="${(navigator.userAgentData?.platform || "Browser").replace(/"/g, "")}", DeviceId="${deviceId}", Version="3.0"${token ? `, Token="${token}"` : ""}`;
+    },
+    async api(path, opts = {}) {
+      const r = await fetch(jf.cfg.server + path, { ...opts, headers: { Authorization: jf.authHeader(jf.cfg.token), "Content-Type": "application/json", ...(opts.headers || {}) } });
+      if (r.status === 401) { jf.signOut(); toast("Your library sign-in expired. Connect again in Settings."); throw new Error("401"); }
+      if (!r.ok) throw new Error(r.status);
+      return r.status === 204 ? null : r.json().catch(() => null);
+    },
+    async login(server, username, pw) {
+      server = server.trim().replace(/\/+$/, "").replace(/\/web(\/.*)?$/, "");
+      if (!/^https?:\/\//i.test(server)) server = "https://" + server;
+      if (location.protocol === "https:" && /^http:\/\//i.test(server) && !/^http:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/i.test(server))
+        throw new Error("This address starts with http://, which browsers block on a secure page. Use an https address, for example from Tailscale (see the steps below).");
+      let r;
+      try {
+        r = await fetch(server + "/Users/AuthenticateByName", { method: "POST", headers: { Authorization: jf.authHeader(), "Content-Type": "application/json" }, body: JSON.stringify({ Username: username, Pw: pw || "" }) });
+      } catch { throw new Error("Couldn't reach that server. Check the address, make sure Jellyfin is running, and that this device is connected (for Tailscale, the app must be on)."); }
+      if (r.status === 401) throw new Error("Wrong username or password.");
+      if (!r.ok) throw new Error(`The server answered with an error (${r.status}). Check the address points at Jellyfin.`);
+      const j = await r.json();
+      let serverName = "";
+      try { serverName = (await (await fetch(server + "/System/Info/Public")).json()).ServerName || ""; } catch { /* optional */ }
+      jf.cfg = { server, token: j.AccessToken, userId: j.User.Id, user: j.User.Name, serverName: serverName || new URL(server).hostname };
+      store.set("jellyfin", jf.cfg);
+      memo.forEach((_, k) => { if (k.startsWith("jf")) memo.delete(k); });
+    },
+    signOut() {
+      if (jf.cfg?.token) fetch(jf.cfg.server + "/Sessions/Logout", { method: "POST", headers: { Authorization: jf.authHeader(jf.cfg.token) } }).catch(() => {});
+      jf.cfg = null; store.set("jellyfin", null);
+    },
+    img(id, type = "Primary", h = 600) { return `${jf.cfg.server}/Items/${id}/Images/${type}?fillHeight=${h}&quality=90`; },
+    FIELDS: "Overview,Genres,ProductionYear,MediaSources,CommunityRating,OfficialRating,UserData",
+    item(x) {
+      const img = x.ImageTags?.Primary ? jf.img(x.Id) : x.SeriesPrimaryImageTag && x.SeriesId ? jf.img(x.SeriesId) : x.AlbumPrimaryImageTag ? jf.img(x.AlbumId) : "";
+      const ep = x.Type === "Episode" ? `S${x.ParentIndexNumber ?? "?"} · E${x.IndexNumber ?? "?"}` : "";
+      return { key: "jf:" + x.Id, src: "jf", id: x.Id, title: x.Type === "Episode" && x.SeriesName ? `${x.SeriesName}` : x.Name, epName: x.Type === "Episode" ? x.Name : "",
+        year: x.ProductionYear || "", poster: img, desc: x.Overview || "", genres: x.Genres || [], rating: x.CommunityRating ? +x.CommunityRating.toFixed(1) : null,
+        rated: x.OfficialRating || "", type: x.Type,
+        backdrop: x.BackdropImageTags?.length ? jf.img(x.Id, "Backdrop", 900) : x.ParentBackdropImageTags?.length && x.ParentBackdropItemId ? jf.img(x.ParentBackdropItemId, "Backdrop", 900) : "", runtime: x.RunTimeTicks ? fmtTime(x.RunTimeTicks / 1e7) : "", seriesId: x.SeriesId,
+        sub: [ep || x.ProductionYear, x.Type === "Series" ? "Series" : x.RunTimeTicks ? fmtTime(x.RunTimeTicks / 1e7) : ""].filter(Boolean) };
+    },
+    async list(params, page = 1, size = 60) {
+      const j = await cached(`jf:list:${params}:${page}`, () => jf.api(`/Users/${jf.cfg.userId}/Items?Recursive=true&Fields=${jf.FIELDS}&EnableImageTypes=Primary,Backdrop&StartIndex=${(page - 1) * size}&Limit=${size}&${params}`));
+      return { items: (j.Items || []).map(jf.item), more: (j.TotalRecordCount || 0) > page * size };
+    },
+    async latest(type) {
+      const j = await cached("jf:latest:" + type, () => jf.api(`/Users/${jf.cfg.userId}/Items/Latest?IncludeItemTypes=${type}&Limit=40&Fields=${jf.FIELDS}`));
+      return { items: (j || []).map(jf.item), more: false };
+    },
+    async resume() {
+      const j = await jf.api(`/Users/${jf.cfg.userId}/Items/Resume?MediaTypes=Video&Limit=30&Fields=${jf.FIELDS}`);
+      return { items: (j.Items || []).map((x) => ({ ...jf.item(x), resumeId: x.Id, pct: x.UserData?.PlayedPercentage || 0 })), more: false };
+    },
+    video(x) { // one playable file
+      const ms = (x.MediaSources || [])[0] || {};
+      const ep = x.Type === "Episode" ? `S${x.ParentIndexNumber ?? "?"}·E${x.IndexNumber ?? "?"} ${x.Name}` : x.Name;
+      return { name: "jf:" + x.Id, jfId: x.Id, ms, label: ep, length: x.RunTimeTicks ? x.RunTimeTicks / 1e7 : 0,
+        pos: x.UserData?.PlaybackPositionTicks ? x.UserData.PlaybackPositionTicks / 1e7 : 0, played: !!x.UserData?.Played,
+        direct: jf.canDirect(ms), get offlineUrl() { return this.direct ? this.url : null; }, download: `${jf.cfg.server}/Items/${x.Id}/Download?api_key=${jf.cfg.token}`,
+        url: `${jf.cfg.server}/Videos/${x.Id}/stream?static=true&MediaSourceId=${ms.Id || x.Id}&api_key=${jf.cfg.token}` };
+    },
+    canDirect(ms) {
+      const v = document.createElement("video");
+      const container = (ms.Container || "").toLowerCase();
+      const vs = (ms.MediaStreams || []).find((s) => s.Type === "Video");
+      const as = (ms.MediaStreams || []).filter((s) => s.Type === "Audio");
+      const vOk = !vs || ["h264", "vp8", "vp9", "av1"].includes((vs.Codec || "").toLowerCase()) || ((vs.Codec || "").toLowerCase() === "hevc" && v.canPlayType('video/mp4; codecs="hvc1.1.6.L93.B0"'));
+      const aOk = !as.length || as.some((a) => ["aac", "mp3", "opus", "vorbis", "flac"].includes((a.Codec || "").toLowerCase()));
+      return /^(mp4|m4v|mov|webm)(,|$)/.test(container) && vOk && aOk;
+    },
+    hls(v) {
+      const ps = Math.random().toString(36).slice(2);
+      return `${jf.cfg.server}/Videos/${v.jfId}/master.m3u8?MediaSourceId=${v.ms.Id || v.jfId}&DeviceId=${deviceId}&api_key=${jf.cfg.token}&PlaySessionId=${ps}` +
+        "&VideoCodec=h264&AudioCodec=aac,mp3&TranscodingMaxAudioChannels=2&SegmentContainer=ts&MinSegments=1&BreakOnNonKeyFrames=True&VideoBitrate=10000000&AudioBitrate=192000&MaxWidth=1920";
+    },
+    async details(it) {
+      const x = await jf.api(`/Users/${jf.cfg.userId}/Items/${it.id}?Fields=${jf.FIELDS},People`);
+      if (x.Type === "Episode" && x.SeriesId && !it.keepEpisode) { // open the whole series, starting at this episode
+        it.startEpisode = x.Id; it.id = x.SeriesId; it.key = "jf:" + x.SeriesId;
+        return jf.details(it);
+      }
+      Object.assign(it, jf.item(x));
+      it.backdrop = x.BackdropImageTags?.length ? jf.img(x.Id, "Backdrop", 900) : "";
+      it.cast = (x.People || []).filter((p) => p.Type === "Actor").slice(0, 12).map((p) => ({ name: p.Name, role: p.Role, img: p.PrimaryImageTag ? jf.img(p.Id, "Primary", 200) : "" }));
+      if (x.Type === "Series") {
+        const eps = await jf.api(`/Shows/${x.Id}/Episodes?UserId=${jf.cfg.userId}&Fields=${jf.FIELDS}`);
+        it.videos = (eps.Items || []).filter((e) => e.LocationType !== "Virtual").map(jf.video);
+        it.seasons = null;
+      } else if (x.Type === "BoxSet" || x.IsFolder) {
+        const kids = await jf.api(`/Users/${jf.cfg.userId}/Items?ParentId=${x.Id}&Fields=${jf.FIELDS}&SortBy=ProductionYear,SortName`);
+        it.videos = (kids.Items || []).filter((k) => k.MediaType === "Video").map(jf.video);
+      } else it.videos = [jf.video(x)];
+      if (it.startEpisode) { const i = it.videos.findIndex((v) => v.jfId === it.startEpisode); if (i >= 0) it.startIdx = i; }
+      it.links = [];
+      return it;
+    },
+    report(kind, v, sec, paused = false) {
+      if (!jf.on() || !v?.jfId) return;
+      jf.api(`/Sessions/Playing${kind}`, { method: "POST", body: JSON.stringify({ ItemId: v.jfId, MediaSourceId: v.ms?.Id || v.jfId, PositionTicks: Math.round((sec || 0) * 1e7), IsPaused: paused, PlayMethod: v.direct ? "DirectStream" : "Transcode" }) }).catch(() => {});
+    },
+  };
+
+  const PROVIDERS = { ia, mv, tv, anime: an, jf };
+  const settings = Object.assign({ playableOnly: true }, store.get("settings", {}));
+  const saveSettings = () => store.set("settings", settings);
+  const canPlay = (it) => !!(it.free || it.src === "jf");
+
+  // ---------- Offline downloads (saved inside the app with the Cache API) ----------
+  const OFF_CACHE = "markbox-offline";
+  const offKey = (name) => `${location.origin}${location.pathname.replace(/[^/]*$/, "")}__offline/${encodeURIComponent(name)}`;
+  const offline = {
+    index: store.get("offline", {}), // name -> { name, key, src, id, title, label, poster, size, ts, done }
+    active: new Map(), // name -> { pct, ctrl }
+    supported: "caches" in window && "ReadableStream" in window,
+    has: (name) => !!offline.index[name]?.done,
+    save() { store.set("offline", offline.index); },
+    async start(it, v) {
+      if (!offline.supported) { toast("This browser can't save videos for offline viewing."); return; }
+      if (offline.has(v.name) || offline.active.has(v.name)) return;
+      if (!v.offlineUrl) { toast("This file's format can't be played offline. Use Download file instead."); return; }
+      navigator.storage?.persist?.().catch(() => {});
+      const ctrl = new AbortController();
+      const job = { pct: 0, ctrl, got: 0, total: 0 };
+      offline.active.set(v.name, job);
+      offline.index[v.name] = { name: v.name, key: it.key, src: it.src, id: it.id, title: it.title, label: v.label && v.label !== it.title ? v.label : "", poster: it.poster, size: 0, ts: Date.now(), done: false };
+      offline.save(); emitDl();
+      toast("Downloading in Mark Box…");
+      try {
+        const res = await fetch(v.offlineUrl, { signal: ctrl.signal });
+        if (!res.ok || !res.body) throw new Error(res.status);
+        job.total = +res.headers.get("Content-Length") || 0;
+        const [a, b] = res.body.tee();
+        const cache = await caches.open(OFF_CACHE);
+        const put = cache.put(offKey(v.name), new Response(a, { headers: { "Content-Type": res.headers.get("Content-Type") || "video/mp4" } }));
+        const reader = b.getReader();
+        let last = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          job.got += value.length;
+          job.pct = job.total ? job.got / job.total : 0;
+          if (Date.now() - last > 400) { last = Date.now(); emitDl(); }
+        }
+        await put;
+        Object.assign(offline.index[v.name], { done: true, size: job.got, ts: Date.now() });
+        offline.save();
+        toast(`Saved “${it.title}” for offline`);
+      } catch (e) {
+        delete offline.index[v.name]; offline.save();
+        caches.open(OFF_CACHE).then((c) => c.delete(offKey(v.name))).catch(() => {});
+        if (e.name !== "AbortError") toast(/QuotaExceeded/i.test(e.name + e.message) ? "Not enough storage on this device for that download." : "Download failed. This source may not allow saving; try Download file instead.");
+      } finally { offline.active.delete(v.name); emitDl(); }
+    },
+    cancel(name) { offline.active.get(name)?.ctrl.abort(); },
+    async remove(name) {
+      offline.cancel(name);
+      delete offline.index[name]; offline.save();
+      try { await (await caches.open(OFF_CACHE)).delete(offKey(name)); } catch { /* ignore */ }
+      emitDl();
+    },
+    async blobUrl(name) {
+      const r = await (await caches.open(OFF_CACHE)).match(offKey(name));
+      if (!r) throw new Error("missing");
+      return URL.createObjectURL(await r.blob());
+    },
+    async exportFile(name) {
+      const e = offline.index[name];
+      try {
+        const url = await offline.blobUrl(name);
+        const a = el("a"); a.href = url; a.download = `${(e.title + (e.label ? " - " + e.label : "")).replace(/[\\/:*?"<>|]+/g, " ").trim()}.mp4`;
+        document.body.append(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+      } catch { toast("Couldn't find that file. Download it again."); }
+    },
+  };
+  const dlListeners = new Set();
+  function emitDl() { dlListeners.forEach((f) => f()); }
+  const fmtSize = (b) => (b > 1e9 ? (b / 1e9).toFixed(2) + " GB" : (b / 1e6).toFixed(0) + " MB");
 
   // ================= Rows =================
   const fromList = (p) => p.then((items) => ({ items, more: false }));
@@ -295,6 +478,13 @@
     cartoons: "collection:(classic_cartoons)",
     animation: "collection:(animationandcartoons) AND -collection:(classic_cartoons)",
     tv: "collection:(classic_tv)",
+    kungfu: "collection:(feature_films) AND subject:(\"kung fu\" OR \"martial arts\" OR karate)",
+    western: "collection:(feature_films) AND subject:(western OR westerns)",
+    action: "collection:(feature_films) AND subject:(action OR adventure OR war)",
+    mystery: "collection:(feature_films) AND subject:(mystery OR crime OR detective OR thriller)",
+    docs: "(collection:(feature_films) OR collection:(prelinger) OR collection:(documentaryfilms)) AND subject:(documentary)",
+    cc: "collection:(opensource_movies) AND licenseurl:(*creativecommons*) AND subject:(film OR movie OR short OR animation)",
+    anime: "collection:(animationandcartoons) AND subject:(anime)",
     open: "(title:(sintel OR \"big buck bunny\" OR \"tears of steel\" OR \"elephants dream\" OR \"cosmos laundromat\" OR \"sprite fright\" OR caminandes OR \"agent 327\" OR \"coffee run\" OR \"charge\") AND (subject:(blender) OR creator:(blender) OR description:(blender)))",
   };
   const iaRow = (q, sort) => (page = 1) => ia.list(q, page, 30, sort);
@@ -343,18 +533,51 @@
     freeComedy: { title: "Free Comedy Classics", load: iaRow(IA_Q.comedy), free: true },
     freeSilent: { title: "Free Silent Films", load: iaRow(IA_Q.silent), free: true },
     freeTV:     { title: "Free Classic TV", load: iaRow(IA_Q.tv), free: true },
+    freeKungfu: { title: "Free Kung Fu & Martial Arts", load: iaRow(IA_Q.kungfu), free: true, chip: "Kung Fu" },
+    freeWestern:{ title: "Free Westerns", load: iaRow(IA_Q.western), free: true },
+    freeAction: { title: "Free Action & War", load: iaRow(IA_Q.action), free: true },
+    freeMystery:{ title: "Free Mystery & Crime", load: iaRow(IA_Q.mystery), free: true },
+    freeDocs:   { title: "Free Documentaries", load: iaRow(IA_Q.docs), free: true },
+    freeCC:     { title: "Free Creative Commons Films", load: iaRow(IA_Q.cc), free: true },
+    freeAnime:  { title: "Free Anime & Animation Shorts", load: iaRow(IA_Q.anime), free: true },
+    freeNew:    { title: "Recently Added Free Movies", load: iaRow(IA_Q.trending, "addeddate desc"), free: true },
+
+    // The viewer's own Jellyfin library
+    jfResume:   { title: "Continue Watching · My Library", jf: true, noMore: true, load: () => jf.resume() },
+    jfMovies:   { title: "My Movies · Recently Added", jf: true, load: () => jf.latest("Movie"), more: "jfAllMovies" },
+    jfSeries:   { title: "My Series · New Episodes", jf: true, load: () => jf.latest("Episode"), more: "jfAllSeries" },
+    jfAllMovies:{ title: "All My Movies", jf: true, load: (p = 1) => jf.list("IncludeItemTypes=Movie&SortBy=SortName", p) },
+    jfAllSeries:{ title: "All My Series", jf: true, load: (p = 1) => jf.list("IncludeItemTypes=Series&SortBy=SortName", p) },
+    jfTopRated: { title: "My Top Rated", jf: true, load: (p = 1) => jf.list("IncludeItemTypes=Movie,Series&SortBy=CommunityRating&SortOrder=Descending", p) },
+    jfAnime:    { title: "My Anime", jf: true, load: (p = 1) => jf.list("IncludeItemTypes=Movie,Series&Genres=Anime&SortBy=DateCreated&SortOrder=Descending", p) },
+    jfFamily:   { title: "My Animation & Family", jf: true, load: (p = 1) => jf.list("IncludeItemTypes=Movie,Series&Genres=Animation|Family&SortBy=DateCreated&SortOrder=Descending", p) },
+    jfAction:   { title: "My Action", jf: true, load: (p = 1) => jf.list("IncludeItemTypes=Movie&Genres=Action&SortBy=DateCreated&SortOrder=Descending", p) },
+    jfFavs:     { title: "My Favorites", jf: true, load: (p = 1) => jf.list("IncludeItemTypes=Movie,Series&Filters=IsFavorite&SortBy=SortName", p) },
+  };
+  // Rows that only show trailers and links (hidden when "Only show titles I can play" is on).
+  const isDiscovery = (k) => /^(top10|mv|tv|an)[A-Z0-9]/.test(k) || k === "top10";
+  const rowVisible = (k) => {
+    if (k === "continue") return true;
+    const d = ROWS[k];
+    if (!d) return false;
+    if (d.jf) return jf.on();
+    return !(settings.playableOnly && isDiscovery(k));
   };
 
   const VIEWS = {
-    home:      ["continue", "top10", "tvTrending", "anAiring", "freeMovies", "mvAction", "anPopular", "tvWeb", "freeToons", "mvComedy", "anTop", "tvCrime", "mvKids", "freeOpen", "mvHorror", "anMovies", "mvScifi", "tvFav", "freeNoir"],
-    movies:    ["top10", "mvPopular", "mvAction", "mvComedy", "mvThriller", "mvDrama", "mvScifi", "mvHorror", "mvKids", "mvRomance", "mvDocs", "freeMovies", "freeNoir", "freeSilent"],
-    series:    ["continue", "tvTrending", "tvWeb", "tvDrama", "tvComedy", "tvCrime", "tvScifi", "tvToons", "tvFav", "freeTV"],
-    anime:     ["anAiring", "anPopular", "anTop", "anAction", "anFantasy", "anRomance", "anMovies", "anUpcoming", "mvAnime"],
-    animation: ["mvKids", "tvToons", "anMovies", "freeOpen", "freeToons", "freeAnim", "mvAnime"],
-    free:      ["continue", "freeMovies", "freeOpen", "freeToons", "freeScifi", "freeHorror", "freeNoir", "freeComedy", "freeAnim", "freeTV", "freeSilent"],
+    home:      ["continue", "jfResume", "jfMovies", "jfSeries", "top10", "freeMovies", "tvTrending", "anAiring", "freeNew", "jfAnime", "freeOpen", "mvAction", "freeToons", "anPopular", "jfFamily", "freeAction", "tvWeb", "freeKungfu", "mvComedy", "freeScifi", "anTop", "freeCC", "tvCrime", "freeMystery", "mvKids", "freeHorror", "anMovies", "freeWestern", "mvScifi", "freeNoir", "tvFav", "freeDocs"],
+    movies:    ["jfMovies", "jfAllMovies", "jfAction", "jfTopRated", "top10", "mvPopular", "freeMovies", "freeNew", "mvAction", "freeAction", "mvComedy", "freeComedy", "mvThriller", "freeMystery", "mvDrama", "mvScifi", "freeScifi", "mvHorror", "freeHorror", "freeKungfu", "freeWestern", "mvKids", "mvRomance", "freeCC", "mvDocs", "freeDocs", "freeNoir", "freeSilent"],
+    series:    ["continue", "jfResume", "jfSeries", "jfAllSeries", "tvTrending", "tvWeb", "tvDrama", "tvComedy", "tvCrime", "tvScifi", "tvToons", "tvFav", "freeTV"],
+    anime:     ["jfAnime", "anAiring", "anPopular", "anTop", "anAction", "anFantasy", "anRomance", "anMovies", "anUpcoming", "mvAnime", "freeAnime", "freeOpen", "freeAnim"],
+    animation: ["jfFamily", "mvKids", "tvToons", "anMovies", "freeOpen", "freeToons", "freeAnime", "freeAnim", "mvAnime"],
+    free:      ["continue", "freeMovies", "freeNew", "freeOpen", "freeToons", "freeAction", "freeKungfu", "freeScifi", "freeHorror", "freeMystery", "freeWestern", "freeNoir", "freeComedy", "freeCC", "freeDocs", "freeAnime", "freeAnim", "freeTV", "freeSilent"],
   };
-  const HERO_FROM = { home: ["top10", "anAiring", "tvTrending", "freeMovies"], movies: ["top10"], series: ["tvTrending"], anime: ["anAiring", "anPopular"], animation: ["mvKids", "anMovies"], free: ["freeMovies", "freeToons"] };
-  const CHIPS = ["mvAction", "mvComedy", "anAiring", "mvHorror", "mvScifi", "mvKids", "tvCrime", "mvDrama", "mvRomance", "freeMovies", "freeToons", "mvDocs", "mvThriller"];
+  const HERO_FROM = {
+    home: ["jfMovies", "top10", "anAiring", "tvTrending", "freeMovies", "freeOpen"], movies: ["jfMovies", "top10", "freeMovies"], series: ["jfSeries", "tvTrending", "freeTV"],
+    anime: ["jfAnime", "anAiring", "anPopular", "freeAnime", "freeOpen"], animation: ["jfFamily", "mvKids", "anMovies", "freeOpen", "freeToons"], free: ["freeMovies", "freeOpen", "freeToons"],
+  };
+  const CHIPS = ["jfAllMovies", "jfAllSeries", "mvAction", "freeAction", "mvComedy", "anAiring", "mvHorror", "freeHorror", "mvScifi", "freeScifi", "mvKids", "freeKungfu", "tvCrime", "mvDrama", "freeMovies", "freeToons", "freeWestern", "freeDocs", "mvRomance", "mvThriller"];
+  const CHIP_LABEL = { jfAllMovies: "My Movies", jfAllSeries: "My Series", freeAction: "Free Action", freeHorror: "Free Horror", freeScifi: "Free Sci-Fi", freeWestern: "Westerns", freeDocs: "Documentaries" };
 
   // ================= Personal state =================
   const slim = (it) => ({ key: it.key, src: it.src, id: it.id, title: it.title, year: it.year, poster: it.poster, free: !!it.free, rating: it.rating || null, sub: it.sub || [] });
@@ -374,7 +597,7 @@
     p[it.key] = { ...slim(it), file, t, d, ts: Date.now() };
     store.set("progress", Object.fromEntries(Object.values(p).sort((a, b) => b.ts - a.ts).slice(0, 40).map((e) => [e.key, e])));
   }
-  const continueItems = () => Object.values(progress()).filter((e) => e.d && e.t / e.d > 0.02 && e.t / e.d < 0.95).sort((a, b) => b.ts - a.ts);
+  const continueItems = () => Object.values(progress()).filter((e) => !(e.src === "jf" && jf.on()) && e.src !== "jf").filter((e) => e.d && e.t / e.d > 0.02 && e.t / e.d < 0.95).sort((a, b) => b.ts - a.ts);
 
   // ================= Cards =================
   function genPoster(it) {
@@ -386,7 +609,7 @@
     b.type = "button";
     b.setAttribute("aria-label", `${it.title}${it.year ? ", " + it.year : ""}${it.free ? ", free to watch" : ""}`);
     const pr = progress()[it.key];
-    const poster = `<div class="poster">${genPoster(it)}${it.poster ? `<img alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer">` : ""}${it.free ? `<span class="chip free badge">Free</span>` : ""}${it.rating ? `<span class="rate">${Number(it.rating).toFixed(1)}</span>` : ""}${pr && pr.d ? `<div class="bar" style="width:${Math.min(100, (pr.t / pr.d) * 100).toFixed(1)}%"></div>` : ""}</div>`;
+    const poster = `<div class="poster">${genPoster(it)}${it.poster ? `<img alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer">` : ""}${it.free ? `<span class="chip free badge">Free</span>` : ""}${it.rating ? `<span class="rate">${Number(it.rating).toFixed(1)}</span>` : ""}${it.pct ? `<div class="bar" style="width:${Math.min(100, it.pct).toFixed(1)}%"></div>` : pr && pr.d ? `<div class="bar" style="width:${Math.min(100, (pr.t / pr.d) * 100).toFixed(1)}%"></div>` : ""}</div>`;
     const text = `<div class="t">${esc(it.title)}</div><div class="s">${esc((it.sub || []).filter(Boolean).join(" · "))}</div>`;
     b.innerHTML = rank ? `<span class="num" aria-hidden="true">${rank}</span><div class="stack">${poster}${text}</div>` : poster + text;
     const img = b.querySelector("img");
@@ -427,6 +650,7 @@
     const host = $("#rows");
     host.innerHTML = "";
     const token = (state.token = Symbol());
+    keys = keys.filter((k) => typeof k !== "string" || rowVisible(k));
     keys.forEach((key, i) => {
       if (key === "continue") {
         const items = continueItems();
@@ -439,7 +663,8 @@
       }
       const def = typeof key === "string" ? ROWS[key] : key;
       if (!def) return;
-      const { sec, rail } = rowShell({ ...def, more: def.top10 || def.noMore ? null : () => showGrid(def) });
+      const moreDef = typeof def.more === "string" ? ROWS[def.more] : def;
+      const { sec, rail } = rowShell({ ...def, more: def.top10 || def.noMore ? null : () => showGrid(moreDef) });
       host.append(sec);
       sec._load = () => def.load(1).then(({ items }) => {
         if (token !== state.token) return;
@@ -484,7 +709,8 @@
   }
   function badgesFor(it) {
     const b = [];
-    if (it.free) b.push(`<span class="chip free">Free · Full length</span>`);
+    if (it.src === "jf") b.push(`<span class="chip mine">My Library</span>`);
+    else if (it.free) b.push(`<span class="chip free">Free · Full length</span>`);
     else if (it.src === "anime") b.push(`<span class="chip hot">Anime</span>`);
     else if (it.src === "tv") b.push(`<span class="chip hot">Series</span>`);
     else if (it.src === "mv") b.push(`<span class="chip hot">Movie</span>`);
@@ -495,7 +721,7 @@
   const metaLine = (it) => [it.year, it.runtime, it.type && it.src === "anime" ? it.type : "", it.episodes ? `${it.episodes} episodes` : "", it.network, ...(it.genres || []).slice(0, 2)]
     .filter(Boolean).map((x) => `<span>${esc(x)}</span>`).join("");
   function primaryAction(it) {
-    if (it.free) return { label: "Play", fn: () => play(it) };
+    if (canPlay(it)) return { label: "Play", fn: () => play(it) };
     if (it.trailer || it.preview) return { label: "Trailer", fn: () => playTrailer(it) };
     return { label: "Details", fn: () => openDetails(it) };
   }
@@ -510,11 +736,11 @@
     $("#heroMeta").innerHTML = metaLine(it);
     $("#heroDesc").textContent = toText(it.desc).slice(0, 360);
     const bg = `url("${it.poster}")`;
-    $("#heroBg").style.backgroundImage = bg;
+    $("#heroBg").style.backgroundImage = it.backdrop ? `url("${it.backdrop}")` : bg;
     $("#heroPoster").style.backgroundImage = bg;
     const act = primaryAction(it);
     $("#heroPlay").disabled = $("#heroInfo").disabled = false;
-    $("#heroPlay").className = "btn " + (it.free ? "btn-free" : "btn-primary");
+    $("#heroPlay").className = "btn " + (canPlay(it) ? "btn-free" : "btn-primary");
     $("#heroPlay span").textContent = act.label;
     $("#heroPlay").onclick = act.fn;
     $("#heroInfo").onclick = () => openDetails(it);
@@ -526,6 +752,7 @@
     setMode("grid");
     $("#gridTitle").textContent = def.title;
     const body = $("#gridBody"), more = $("#gridMore");
+    body.className = "grid";
     body.innerHTML = "";
     for (let i = 0; i < 18; i++) body.append(el("div", "skel"));
     let page = 1;
@@ -554,6 +781,7 @@
     $("#gridTitle").textContent = "My List";
     $("#gridMore").hidden = true;
     const body = $("#gridBody");
+    body.className = "grid";
     body.innerHTML = "";
     const l = myList();
     if (!l.length) body.innerHTML = `<p class="empty">Your list is empty. Open any title and tap “My List” to save it here.</p>`;
@@ -597,11 +825,20 @@
     acts.innerHTML = "";
     const add = (cls, html, fn) => { const b = el("button", "btn " + cls, html); b.type = "button"; b.onclick = fn; acts.append(b); return b; };
     const playIcon = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4.5v15l13-7.5z"/></svg>`;
-    if (it.free) {
-      const pr = progress()[it.key];
-      const resume = pr && pr.d && pr.t > 30 && pr.t / pr.d < 0.95;
-      const b = add("btn-free", `${playIcon}<span>${resume ? `Resume ${fmtTime(pr.t)}` : "Play free"}</span>`, () => play(it));
-      if (!loading && it.videos && !it.videos.length) b.disabled = true;
+    if (canPlay(it)) {
+      let label = it.src === "jf" ? "Play" : "Play free";
+      const vids = it.videos;
+      if (it.src === "jf" && vids?.length) {
+        const i = startIndex(it), v = vids[i];
+        if (v.pos > 30 && !v.played) label = vids.length > 1 ? `Resume ${v.label.split(" ")[0]}` : `Resume ${fmtTime(v.pos)}`;
+        else if (vids.length > 1 && i > 0) label = `Play ${v.label.split(" ")[0]}`;
+      } else {
+        const pr = progress()[it.key];
+        if (pr && pr.d && pr.t > 30 && pr.t / pr.d < 0.95) label = `Resume ${fmtTime(pr.t)}`;
+      }
+      const b = add("btn-free", `${playIcon}<span>${label}</span>`, () => play(it));
+      if (!loading && vids && !vids.length) b.disabled = true;
+      if (!loading && vids?.length === 1) dlButtons(it, vids[0], "btn btn-glass").forEach((x) => acts.append(x));
     } else if (it.trailer || it.preview) {
       add("btn-primary", `${playIcon}<span>Watch trailer</span>`, () => playTrailer(it));
     } else if (!loading) {
@@ -617,13 +854,18 @@
     if (loading) return;
     fillWhere(it);
     const extra = $("#mExtra");
-    if (it.src === "ia" && it.videos?.length > 1) {
-      extra.append(el("h3", "section-t", `Episodes &amp; parts · ${it.videos.length}`));
+    if (canPlay(it) && it.videos?.length > 1) {
+      extra.append(el("h3", "section-t", `${it.type === "Series" ? "Episodes" : "Episodes &amp; parts"} · ${it.videos.length}`));
       const list = el("div", "ep-list");
       it.videos.forEach((v, i) => {
-        const b = el("button", "ep", `<b>${i + 1}</b><span>${esc(v.label)}</span>${v.length ? `<small>${fmtTime(v.length)}</small>` : ""}`);
+        const row = el("div", "ep-row");
+        const b = el("button", "ep", `<b>${v.played ? "✓" : i + 1}</b><span>${esc(v.label)}</span>${v.length ? `<small>${fmtTime(v.length)}</small>` : ""}`);
+        b.type = "button";
         b.onclick = () => play(it, i);
-        list.append(b);
+        const a = el("div", "ep-acts");
+        dlButtons(it, v, "mini").forEach((x) => a.append(x));
+        row.append(b, a);
+        list.append(row);
       });
       extra.append(list);
     }
@@ -640,6 +882,46 @@
     }
     if (it.src === "anime" && it.studios) extra.append(el("p", "note", `Studio: ${esc(it.studios)}${it.status ? ` · ${esc(it.status)}` : ""}`));
     if (it.src === "mv" && it.director) extra.append(el("p", "note", `Directed by ${esc(it.director)}${it.release ? ` · Released ${new Date(it.release).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" })}` : ""}`));
+  }
+  // "Download" saves inside Mark Box for offline viewing; "File" saves the original file through the browser.
+  function dlButtons(it, v, cls) {
+    const out = [];
+    if (v.offlineUrl && offline.supported) {
+      const b = el("button", cls); b.type = "button"; b.dataset.dl = v.name;
+      b.onclick = () => {
+        if (offline.has(v.name)) location.hash = "#downloads";
+        else if (offline.active.has(v.name)) offline.cancel(v.name);
+        else offline.start(it, v);
+      };
+      out.push(b);
+    }
+    if (v.download) {
+      const a = el("a", cls, cls === "mini" ? "File" : "Save file"); a.href = v.download; a.target = "_blank"; a.rel = "noopener"; a.download = "";
+      a.title = "Save the original video file to this device";
+      out.push(a);
+    }
+    refreshDlButtons(out);
+    return out;
+  }
+  function refreshDlButtons(list = document.querySelectorAll("[data-dl]")) {
+    list.forEach((b) => {
+      const name = b.dataset?.dl;
+      if (!name) return;
+      const job = offline.active.get(name);
+      const mini = b.classList.contains("mini");
+      b.classList.toggle("done", offline.has(name));
+      b.textContent = offline.has(name) ? "✓ Downloaded" : job ? `${job.total ? Math.round(job.pct * 100) + "%" : fmtSize(job.got)} · Cancel` : mini ? "Download" : "⬇ Download";
+    });
+  }
+  dlListeners.add(() => refreshDlButtons());
+  function startIndex(it) {
+    const vids = it.videos || [];
+    if (it.startIdx != null) return it.startIdx;
+    if (it.src !== "jf" || vids.length < 2) return 0;
+    const inProgress = vids.findIndex((v) => v.pos > 30 && !v.played);
+    if (inProgress >= 0) return inProgress;
+    const lastPlayed = vids.map((v) => v.played).lastIndexOf(true);
+    return lastPlayed >= 0 && lastPlayed < vids.length - 1 ? lastPlayed + 1 : 0;
   }
   function fillWhere(it) {
     const links = it.links || (it.src === "ia" ? [] : [justWatch(it.title)]);
@@ -664,8 +946,8 @@
 
   // ================= Player =================
   const video = $("#video"), yt = $("#yt");
-  let playing = null; // { it, vids, idx }
-  let lastSave = 0;
+  let playing = null; // { it, vids, idx, offline }
+  let lastSave = 0, hlsInst = null, triedHls = false;
   function openPlayer(title, sub) {
     closeDetails();
     $("#player").hidden = false;
@@ -673,24 +955,46 @@
     $("#pTitle").textContent = title; $("#pSub").textContent = sub || "";
     $("#pEpisodes").hidden = true; $("#pEpisodesBtn").hidden = true;
     video.hidden = false; yt.hidden = true; yt.removeAttribute("src");
-    video.removeAttribute("src"); video.load();
+    resetVideo();
     status("Loading…");
+  }
+  function resetVideo() {
+    if (hlsInst) { hlsInst.destroy(); hlsInst = null; }
+    if (video.src.startsWith("blob:")) URL.revokeObjectURL(video.src);
+    video.pause(); video.removeAttribute("src"); video.load();
   }
   async function play(base, idx) {
     const it = { ...base };
     openPlayer(it.title, "");
     try {
-      if (!it.videos) await ia.details(it);
+      if (!it.videos) await PROVIDERS[it.src].details(it);
       const vids = it.videos;
-      if (!vids.length) throw new Error("no video");
+      if (!vids?.length) throw new Error("no video");
       const pr = progress()[it.key];
-      if (idx == null) idx = Math.max(0, pr ? vids.findIndex((v) => v.name === pr.file) : 0);
+      if (idx == null) idx = it.src === "jf" ? startIndex(it) : Math.max(0, pr ? vids.findIndex((v) => v.name === pr.file) : 0);
       playing = { it, vids, idx };
       buildEpisodePanel();
-      loadVideo(pr && pr.file === vids[idx].name && pr.t / (pr.d || 1) < 0.95 ? pr.t : 0);
-    } catch {
-      status(`This title can't be streamed here. <a href="${IA}/details/${encodeURIComponent(it.id)}" target="_blank" rel="noopener">Open on archive.org</a>`);
+      loadVideo(resumeAt(it, vids[idx]));
+    } catch (e) {
+      const link = it.src === "ia" ? ` <a href="${IA}/details/${encodeURIComponent(it.id)}" target="_blank" rel="noopener">Open on archive.org</a>` : "";
+      status(it.src === "jf" && !jf.on() ? "Connect your library in Settings to play this." : `This title can't be played right now.${link}`);
     }
+  }
+  function resumeAt(it, v) {
+    if (it.src === "jf") return v.pos > 30 && !v.played ? v.pos : 0;
+    const pr = progress()[it.key];
+    return pr && pr.file === v.name && pr.t / (pr.d || 1) < 0.95 ? pr.t : 0;
+  }
+  // Play straight from the Downloads tab (works offline).
+  async function playOffline(entry) {
+    openPlayer(entry.title, entry.label || "Downloaded");
+    try {
+      const url = await offline.blobUrl(entry.name);
+      const it = { key: entry.key, src: entry.src, id: entry.id, title: entry.title, poster: entry.poster, free: entry.src === "ia" };
+      const v = { name: entry.name, label: entry.label || entry.title, jfId: entry.name.startsWith("jf:") ? entry.name.slice(3) : null, direct: true, local: url };
+      playing = { it, vids: [v], idx: 0, offline: true };
+      loadVideo(it.src === "ia" ? resumeAt(it, v) : (progress()[it.key]?.file === v.name ? progress()[it.key].t : 0));
+    } catch { status("That download is missing. Remove it and download it again."); }
   }
   function playTrailer(it) {
     openPlayer(it.title, "Official trailer");
@@ -703,15 +1007,40 @@
       video.play().catch(() => status(""));
     } else status(`No trailer available. <a href="${ytSearch(it.title)}" target="_blank" rel="noopener">Search YouTube</a>`);
   }
-  function loadVideo(startAt = 0) {
+  let hlsLib = null;
+  const loadHls = () => hlsLib || (hlsLib = new Promise((res, rej) => {
+    const sc = document.createElement("script");
+    sc.src = "https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js";
+    sc.onload = () => res(window.Hls); sc.onerror = () => { hlsLib = null; rej(new Error("hls")); };
+    document.head.append(sc);
+  }));
+  async function attachHls(url, startAt) {
+    if (video.canPlayType("application/vnd.apple.mpegurl")) { video.src = url; return; }
+    const Hls = await loadHls();
+    if (!Hls.isSupported()) throw new Error("no hls");
+    hlsInst = new Hls({ startPosition: startAt > 5 ? startAt : -1 });
+    hlsInst.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) status("The server couldn't convert this video. Check that Jellyfin transcoding is enabled."); });
+    hlsInst.loadSource(url);
+    hlsInst.attachMedia(video);
+  }
+  async function loadVideo(startAt = 0, forceHls = false) {
     const { it, vids, idx } = playing;
     const v = vids[idx];
-    $("#pSub").textContent = vids.length > 1 ? `${idx + 1} / ${vids.length} · ${v.label}` : (it.year ? String(it.year) : "");
+    $("#pSub").textContent = vids.length > 1 ? `${idx + 1} / ${vids.length} · ${v.label}` : (v.label !== it.title ? v.label : it.year ? String(it.year) : "");
     status("Loading…");
-    video.src = v.url;
-    video.onloadedmetadata = () => { if (startAt > 5 && startAt < video.duration - 10) video.currentTime = startAt; };
-    video.play().catch(() => status(""));
+    resetVideo();
+    triedHls = forceHls;
+    video.onloadedmetadata = () => { if (startAt > 5 && startAt < video.duration - 10 && Math.abs(video.currentTime - startAt) > 3) video.currentTime = startAt; };
+    try {
+      let local = v.local;
+      if (!local && offline.has(v.name)) { try { local = await offline.blobUrl(v.name); } catch { /* stream instead */ } }
+      if (local) video.src = local;
+      else if (v.jfId && (!v.direct || forceHls)) await attachHls(jf.hls(v), startAt);
+      else video.src = v.url;
+      video.play().catch(() => status(""));
+    } catch { status("This video can't play in this browser."); }
     document.querySelectorAll(".p-episodes .ep").forEach((b, i) => b.classList.toggle("on", i === idx));
+    if (v.jfId) jf.report("", v, startAt);
   }
   function buildEpisodePanel() {
     const panel = $("#pEpisodes");
@@ -719,39 +1048,54 @@
     if (playing.vids.length < 2) return;
     $("#pEpisodesBtn").hidden = false;
     playing.vids.forEach((v, i) => {
-      const b = el("button", "ep", `<b>${i + 1}</b><span>${esc(v.label)}</span>`);
-      b.onclick = () => { playing.idx = i; loadVideo(0); panel.hidden = true; };
+      const b = el("button", "ep", `<b>${i + 1}</b><span>${esc(v.label)}</span>${offline.has(v.name) ? "<small>⬇</small>" : ""}`);
+      b.onclick = () => { playing.idx = i; loadVideo(resumeAt(playing.it, v)); panel.hidden = true; };
       panel.append(b);
     });
   }
-  function status(html) { const s = $("#pStatus"); s.innerHTML = html; s.hidden = !html; }
+  function status(html) { const st = $("#pStatus"); st.innerHTML = html; st.hidden = !html; }
+  const curVid = () => playing && playing.vids[playing.idx];
   video.addEventListener("playing", () => status(""));
   video.addEventListener("waiting", () => status("Buffering…"));
+  video.addEventListener("pause", () => { const v = curVid(); if (v?.jfId && !video.ended) jf.report("/Progress", v, video.currentTime, true); });
   video.addEventListener("error", () => {
-    if (!video.getAttribute("src")) return;
-    status(playing ? `This video won't play in your browser. <a href="${IA}/details/${encodeURIComponent(playing.it.id)}" target="_blank" rel="noopener">Open on archive.org</a>` : "This trailer isn't available right now.");
+    if (!video.getAttribute("src") && !hlsInst) return;
+    const v = curVid();
+    if (v?.jfId && !triedHls && !v.local) { loadVideo(video.currentTime || resumeAt(playing.it, v), true); return; } // fall back to server conversion
+    status(playing ? (playing.it.src === "ia" ? `This video won't play in your browser. <a href="${IA}/details/${encodeURIComponent(playing.it.id)}" target="_blank" rel="noopener">Open on archive.org</a>` : "This video won't play in your browser.") : "This trailer isn't available right now.");
   });
   video.addEventListener("timeupdate", () => {
     if (!playing || !video.duration) return;
     const now = Date.now();
-    if (now - lastSave > 4000) { lastSave = now; saveProgress(playing.it, playing.vids[playing.idx].name, video.currentTime, video.duration); }
+    if (now - lastSave > 5000) {
+      lastSave = now;
+      const v = curVid();
+      saveProgress(playing.it, v.name, video.currentTime, video.duration);
+      if (v.jfId) { jf.report("/Progress", v, video.currentTime); v.pos = video.currentTime; }
+    }
   });
   video.addEventListener("ended", () => {
     if (!playing) return;
-    saveProgress(playing.it, playing.vids[playing.idx].name, video.duration, video.duration);
-    if (playing.idx < playing.vids.length - 1) { playing.idx++; loadVideo(0); toast("Playing next"); }
+    const v = curVid();
+    saveProgress(playing.it, v.name, video.duration, video.duration);
+    if (v.jfId) { jf.report("/Stopped", v, video.duration); v.played = true; }
+    if (playing.idx < playing.vids.length - 1) { playing.idx++; loadVideo(resumeAt(playing.it, curVid())); toast("Playing next"); }
   });
   let idleTimer;
   $("#player").addEventListener("pointermove", () => { $("#player").classList.remove("idle"); clearTimeout(idleTimer); idleTimer = setTimeout(() => $("#player").classList.add("idle"), 2800); });
   function closePlayer() {
-    if (playing && video.duration) saveProgress(playing.it, playing.vids[playing.idx].name, video.currentTime, video.duration);
-    video.pause(); video.removeAttribute("src"); video.load();
+    const v = curVid();
+    if (playing && video.duration) {
+      saveProgress(playing.it, v.name, video.currentTime, video.duration);
+      if (v.jfId) jf.report("/Stopped", v, video.currentTime);
+    }
+    resetVideo();
     yt.removeAttribute("src");
-    const wasFree = !!playing;
+    const wasPlaying = !!playing;
     playing = null;
     $("#player").hidden = true;
     document.body.style.overflow = "";
-    if (wasFree && VIEWS[state.view]?.includes("continue")) route();
+    if (wasPlaying && state.view !== "search" && state.view !== "downloads" && state.view !== "mylist") { memo.forEach((_, k) => { if (k.startsWith("jf:latest") ) memo.delete(k); }); route(); }
   }
 
   // ================= Search =================
@@ -761,11 +1105,12 @@
     if (!q) return;
     const iaQ = `(title:(${q}) OR creator:(${q}) OR subject:(${q})) AND (collection:(feature_films) OR collection:(classic_tv) OR collection:(classic_cartoons) OR collection:(silent_films) OR collection:(film_noir) OR collection:(animationandcartoons))`;
     const rows = [
-      { title: `Movies matching “${term}”`, load: () => fromList(mv.search(q)) },
-      { title: "Series", load: () => fromList(tv.search(q)) },
-      { title: "Anime", load: (page = 1) => an.list(`/anime?q=${encodeURIComponent(q)}&sfw=true&limit=24&order_by=members&sort=desc`, page) },
-      { title: "Free to watch now", load: (page = 1) => ia.list(iaQ, page, 30) },
-    ];
+      jf.on() && { title: `In my library: “${term}”`, load: (page = 1) => jf.list(`IncludeItemTypes=Movie,Series,Episode&SearchTerm=${encodeURIComponent(q)}`, page, 40) },
+      { title: jf.on() ? "Free to watch now" : `Free to watch: “${term}”`, load: (page = 1) => ia.list(iaQ, page, 30) },
+      !settings.playableOnly && { title: "Movies (trailers)", load: () => fromList(mv.search(q)) },
+      !settings.playableOnly && { title: "Series (info)", load: () => fromList(tv.search(q)) },
+      !settings.playableOnly && { title: "Anime (trailers)", load: (page = 1) => an.list(`/anime?q=${encodeURIComponent(q)}&sfw=true&limit=24&order_by=members&sort=desc`, page) },
+    ].filter(Boolean);
     renderRows(rows);
     // Tell the viewer if nothing came back anywhere.
     const token = state.token;
@@ -776,7 +1121,7 @@
   function renderChips() {
     const bar = $("#chipsBar");
     bar.innerHTML = "";
-    CHIPS.forEach((k) => { const d = ROWS[k]; const b = el("button", null, esc(d.chip)); b.type = "button"; b.onclick = () => showGrid(d); bar.append(b); });
+    CHIPS.filter(rowVisible).forEach((k) => { const d = ROWS[k]; const b = el("button", null, esc(CHIP_LABEL[k] || d.chip || d.title)); b.type = "button"; b.onclick = () => showGrid(d); bar.append(b); });
   }
   function route() {
     const h = decodeURIComponent(location.hash.replace(/^#/, ""));
@@ -794,18 +1139,111 @@
       markNav();
       return runSearch(term);
     }
-    renderView(VIEWS[h] || h === "mylist" ? h : "home");
+    renderView(VIEWS[h] || h === "mylist" || h === "downloads" ? h : "home");
   }
   function renderView(view) {
     state.view = view;
     markNav();
     closeDetails();
     if (view === "mylist") return showMyList();
+    if (view === "downloads") return showDownloads();
     setMode("rows");
     resetHero();
+    renderChips();
     renderRows(VIEWS[view], { heroFrom: HERO_FROM[view] });
+    if (!jf.on() && ["home", "movies", "series", "anime", "animation"].includes(view)) {
+      const c = el("div", "callout", `<div><b>Watch your own movies and shows here</b><p>Connect your Jellyfin library to stream and download everything you own inside Mark Box.</p></div>`);
+      const b = el("button", "btn btn-primary btn-sm", "Connect my library"); b.type = "button"; b.onclick = openSettings;
+      c.append(b);
+      const host = $("#rows"), at = host.children[view === "home" ? Math.min(1, host.children.length) : 0];
+      host.insertBefore(c, at || null);
+    }
+    if (settings.playableOnly && !jf.on() && ["series", "anime"].includes(view) && $("#rows").querySelectorAll(".row").length < 2)
+      $("#rows").insertAdjacentHTML("beforeend", `<p class="note" style="padding:0 var(--gr) 0 var(--gl)">Want to browse new releases too? Turn off “Only show titles I can play” in Settings to see them with trailers.</p>`);
     window.scrollTo({ top: 0 });
   }
+
+  // ================= Downloads view =================
+  function showDownloads() {
+    setMode("grid");
+    state.token = Symbol();
+    $("#gridTitle").textContent = "Downloads";
+    $("#gridMore").hidden = true;
+    const body = $("#gridBody");
+    body.className = "";
+    const render = () => {
+      if (state.view !== "downloads") return;
+      const entries = Object.values(offline.index).sort((a, b) => b.ts - a.ts);
+      body.innerHTML = "";
+      if (!offline.supported) { body.innerHTML = `<p class="empty">This browser can't save videos inside apps. Use “Save file” on a title instead.</p>`; return; }
+      if (!entries.length) { body.innerHTML = `<p class="empty">No downloads yet. Open any title you can play and tap “Download” to watch it offline, even without internet.</p>`; return; }
+      const list = el("div", "dl-list");
+      entries.forEach((e) => {
+        const job = offline.active.get(e.name);
+        const row = el("div", "dl", `<div class="thumb" style="${e.poster ? `background-image:url('${esc(e.poster)}')` : ""}"></div>
+          <div class="info"><b>${esc(e.title)}</b><small>${esc(e.label || "")}</small>
+          <small>${e.done ? `${fmtSize(e.size)} · Saved ${new Date(e.ts).toLocaleDateString()}` : job ? `Downloading… ${job.total ? Math.round(job.pct * 100) + "% of " + fmtSize(job.total) : fmtSize(job.got)}` : "Interrupted"}</small>
+          ${!e.done ? `<div class="prog"><i style="width:${job ? Math.round(job.pct * 100) : 0}%"></i></div>` : ""}</div>`);
+        const acts = el("div", "acts");
+        const mk = (label, cls, fn) => { const b = el("button", "btn btn-sm " + cls, label); b.type = "button"; b.onclick = fn; acts.append(b); };
+        if (e.done) {
+          mk("▶ Play", "btn-free", () => playOffline(e));
+          mk("Save to device", "btn-glass", () => offline.exportFile(e.name));
+          mk("Delete", "btn-glass", () => offline.remove(e.name));
+        } else if (job) mk("Cancel", "btn-glass", () => offline.remove(e.name));
+        else mk("Remove", "btn-glass", () => offline.remove(e.name));
+        row.append(acts);
+        list.append(row);
+      });
+      body.append(list);
+      if (navigator.storage?.estimate) navigator.storage.estimate().then(({ usage, quota }) => {
+        if (state.view === "downloads" && usage != null) body.insertAdjacentHTML("beforeend", `<p class="note" style="padding:0 var(--gr) 0 var(--gl)">Using ${fmtSize(usage)} of about ${fmtSize(quota)} available to Mark Box on this device.</p>`);
+      });
+    };
+    dlView = render;
+    render();
+  }
+  let dlView = null;
+  dlListeners.add(() => dlView && state.view === "downloads" && dlView());
+
+  // ================= Settings =================
+  function openSettings() {
+    const m = $("#settings");
+    m.hidden = false;
+    document.body.style.overflow = "hidden";
+    syncSettings();
+    if (navigator.storage?.estimate) navigator.storage.estimate().then(({ usage, quota }) => {
+      const n = Object.values(offline.index).filter((e) => e.done).length;
+      $("#storageInfo").textContent = `${n} video${n === 1 ? "" : "s"} saved for offline. Using ${fmtSize(usage || 0)} of about ${fmtSize(quota || 0)} this browser allows.`;
+    }); else $("#storageInfo").textContent = "Storage details aren't available in this browser.";
+  }
+  function closeSettings() { $("#settings").hidden = true; document.body.style.overflow = ""; }
+  function syncSettings() {
+    $("#jfConnected").hidden = !jf.on();
+    $("#jfForm").hidden = jf.on();
+    if (jf.on()) { $("#jfServerName").textContent = jf.cfg.serverName; $("#jfUserName").textContent = jf.cfg.user; }
+    else { const last = store.get("jfLast", {}); if (last.server && !$("#jfServer").value) { $("#jfServer").value = last.server; $("#jfUser").value = last.user || ""; } }
+    $("#playableOnly").checked = settings.playableOnly;
+  }
+  $("#settingsBtn").onclick = openSettings;
+  document.querySelectorAll("[data-close-settings]").forEach((b) => b.addEventListener("click", closeSettings));
+  $("#jfForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const err = $("#jfError"), btn = $("#jfConnect");
+    err.hidden = true; btn.disabled = true; btn.textContent = "Connecting…";
+    try {
+      await jf.login($("#jfServer").value, $("#jfUser").value.trim(), $("#jfPass").value);
+      store.set("jfLast", { server: jf.cfg.server, user: jf.cfg.user });
+      $("#jfPass").value = "";
+      toast(`Connected to ${jf.cfg.serverName}`);
+      syncSettings();
+      closeSettings();
+      renderView(state.view === "mylist" || state.view === "downloads" || state.view === "search" ? "home" : state.view);
+    } catch (ex) { err.textContent = ex.message; err.hidden = false; }
+    finally { btn.disabled = false; btn.textContent = "Connect library"; }
+  });
+  $("#jfDisconnect").onclick = () => { jf.signOut(); syncSettings(); toast("Library disconnected"); if (state.view !== "downloads") route(); };
+  $("#playableOnly").addEventListener("change", (e) => { settings.playableOnly = e.target.checked; saveSettings(); if (state.view !== "downloads" && state.view !== "mylist") route(); });
   function markNav() { document.querySelectorAll("[data-nav]").forEach((a) => a.classList.toggle("active", a.dataset.nav === state.view)); }
 
   $("#searchForm").addEventListener("submit", (e) => {
@@ -826,7 +1264,7 @@
   $("#pBack").onclick = closePlayer;
   $("#pEpisodesBtn").onclick = () => { $("#pEpisodes").hidden = !$("#pEpisodes").hidden; };
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") { if (!$("#player").hidden) closePlayer(); else if (!$("#modal").hidden) closeDetails(); }
+    if (e.key === "Escape") { if (!$("#player").hidden) closePlayer(); else if (!$("#modal").hidden) closeDetails(); else if (!$("#settings").hidden) closeSettings(); }
     if (e.key === "/" && document.activeElement?.tagName !== "INPUT") { e.preventDefault(); $("#searchInput").focus(); }
   });
 
