@@ -1,10 +1,15 @@
 # Mark Box
 
-A movie and TV streaming web app. Browse rows by genre, search, open a title for details, and watch in a full-screen player with **My List**, **Continue Watching** (resumes where you stopped) and episode lists for series.
+A modern streaming-style web app for movies, series, anime and cartoons.
 
-All content streams from the Internet Archive's public-domain and freely licensed collections (feature films, film noir, silent films, classic cartoons, classic TV), so it is free and legal to watch. No API keys, servers or build step needed.
+- **Movies**: today's top 10 and genre rows from Apple's catalog, with posters and official trailers that play in the app.
+- **Series**: trending shows and new episodes on streaming services from TVmaze, with seasons, cast and links to the service that carries each show.
+- **Anime**: this season's anime, top rated, most popular, anime movies and upcoming titles from MyAnimeList (via the Jikan API), with YouTube trailers and links to Crunchyroll, Netflix and others.
+- **Free to watch**: full-length public-domain and Creative Commons films, cartoons and classic TV from the Internet Archive, streamed right in the app with resume, episode lists and auto-play next.
 
-It can also be installed on a phone's home screen like an app (it's a PWA).
+Also: hero carousel, category chips, search across every source, My List, Continue Watching, share links, a bottom tab bar on phones, and install-to-home-screen (PWA). No API keys, servers or build step needed.
+
+Copyrighted titles are never streamed by the app; their detail pages link to legal services where you can watch them.
 
 ## Go live with GitHub Pages
 
